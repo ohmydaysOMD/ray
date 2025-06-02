@@ -1,316 +1,211 @@
 import streamlit as st
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+st.set_page_config(page_title="Chest X-ray Report Generator", layout="centered")
+
 from PIL import Image
-import numpy as np
 import torch
-from sklearn.utils import shuffle
-from scipy.ndimage import zoom
-from io import BytesIO
-import time
-from llama_index.core import SimpleDirectoryReader
-from llama_index.core.node_parser import SimpleNodeParser
-from dotenv import load_dotenv
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import Paragraph, Frame
+from reportlab.lib.units import inch
+from reportlab.lib.enums import TA_CENTER
 import os
 import re
-from samples import examples, samples
-from concepts import pneumonia_concepts, covid19_concepts, normal_concepts, concepts
-from utils import simulate_file_upload, transcribe
-from rag import load_data as _load_data
-from rag import generate_report
-from cbm_inference_app import get_image_concept_similarity_vector
-from heatmap import get_heatmap
-from config import W_F, num_classes, class_mapping, num_concepts
+import pandas as pd
+from datetime import datetime
+from utils.dino_embedding import load_rad_dino, extract_rad_dino_prompt
 
-load_dotenv()
-os.environ["OPENAI_MODEL_NAME"] = 'gpt-4'
+# === CONFIG ===
+MODEL_DIR = "models/clinical_t5_final"
+REPORT_DIR = "outputs/reports"
+LOGO_PATH = "assets/logo.png"
+SIGN_PATH = "assets/signature.png"
+LOG_CSV = "outputs/report_logs.csv"
+os.makedirs(REPORT_DIR, exist_ok=True)
 
-@st.cache_resource(show_spinner=False)
-def load_data(files_directory):
-    return _load_data(files_directory)
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-pneumonia_index = load_data('docs_pneumonia')
-covid_index = load_data('docs_covid')
+# === Load models ===
+@st.cache_resource
+def load_models():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_DIR).to(device)
+    model.eval()
+    processor, dino_model = load_rad_dino()
+    return tokenizer, model, processor, dino_model
 
-st.set_page_config(
-    page_title="Demo IML",
-    layout="wide"
-)
+tokenizer, model, processor, dino_model = load_models()
 
-st.subheader('Demonstrating Enhanced Interpretability in Radiology Report Generation with Multi-Agent RAG and Concept Bottleneck Models')
+# === Post-process report for grammar and readability ===
+def clean_findings(text):
+    lines = text.strip().split("\n")
+    seen = set()
+    cleaned = []
 
-if 'report_generated' not in st.session_state:
-    st.session_state.report_generated = False
-    st.session_state.report = ""
-    st.session_state.uploaded_file = None
-    st.session_state.logs = ""
-    st.session_state.logs_generated = False
-    st.session_state.selected_image = None
-    st.session_state.messages = None
-    st.session_state.radio = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
 
-selected_sample = st.selectbox("Select a sample image or upload image", ["Upload Image"] + list(examples.keys()))
+        # Capitalize and punctuate
+        line = line[0].upper() + line[1:] if line else ""
+        if not line.endswith("."):
+            line += "."
 
-if "previous_selection" not in st.session_state:
-        st.session_state.previous_selection = selected_sample
+        # Remove duplicates
+        line_key = re.sub(r"[^\w\s]", "", line.lower())
+        if line_key in seen:
+            continue
+        seen.add(line_key)
 
-if 'toggles' not in st.session_state:
-    st.session_state.toggles = None
+        # Bullet point
+        cleaned.append(f"• {line}")
 
-if selected_sample == "Upload Image":
-    using_sample = False
+    return "\n".join(cleaned)
 
-if selected_sample != "Upload Image":
-    if st.session_state.previous_selection != selected_sample:
-        st.session_state.report_generated = False
-        st.session_state.report = ""
-        st.session_state.logs = ""
-        st.session_state.logs_generated = False
-        st.session_state.uploaded_file = None
-        st.session_state.selected_image = None
-        st.session_state.messages = None
-        st.session_state.radio = None
-        st.session_state.toggles = None
-        st.session_state.previous_selection = selected_sample
-        st.session_state.sample_delay_done = False
-    uploaded_file = simulate_file_upload(examples[selected_sample])
-    st.session_state.uploaded_file = uploaded_file
-    st.session_state.report_generated = True
-    st.session_state.report = samples[examples[selected_sample]]["report"]
-    st.session_state.logs = samples[examples[selected_sample]]["logs"]
-    st.session_state.logs_generated = True
-    st.session_state.radio = 1
-    using_sample = True
-    if not st.session_state.get("sample_delay_done", False):
-        with st.spinner("Loading sample..."):
-            time.sleep(2)  
-        st.session_state.sample_delay_done = True
+# === Generate Report ===
+def generate_report(image: Image.Image) -> str:
+    prompt = extract_rad_dino_prompt(image, processor, dino_model)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256).to(device)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=128)
+    raw_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return clean_findings(raw_output)
 
-else:
-    uploaded_file = st.file_uploader("Upload the chest x-ray image", type=['png', 'jpg', 'jpeg'])
+# === Log Report to CSV ===
+def log_report(metadata, file_path):
+    df = pd.DataFrame([{
+        "Patient Name": metadata["name"],
+        "Referred By": metadata["ref_by"],
+        "Date Taken": metadata["date_taken"],
+        "Date of Report": metadata["date_report"],
+        "Complaint": metadata.get("complaint", ""),
+        "History": metadata.get("history", ""),
+        "PDF Path": file_path,
+        "Generated At": str(datetime.now())
+    }])
 
-if uploaded_file is not None:
-    if uploaded_file != st.session_state.uploaded_file:
-        # Reset the session state for a new upload
-        st.session_state.report_generated = False
-        st.session_state.report = ""
-        st.session_state.logs = ""
-        st.session_state.logs_generated = False
-        st.session_state.uploaded_file = uploaded_file
-        st.session_state.nodes = False
-        st.session_state.selected_image = None
-        st.session_state.messages = None
-        st.session_state.radio = None
-        st.session_state.toggles = None
+    df.to_csv(LOG_CSV, mode="a", index=False, header=not os.path.exists(LOG_CSV))
 
-    r = get_image_concept_similarity_vector(uploaded_file)
-    predicted_class = torch.argmax(torch.nn.functional.softmax(torch.matmul(r, W_F.T), dim=0)).item()
-    contribution = W_F * r
-    contribution = contribution.detach().numpy()
-    conc, cont = shuffle(concepts, contribution[predicted_class])
-    paired_lists = list(zip(conc, cont))
-    sorted_paired_lists = sorted(paired_lists, key=lambda x: abs(x[1]), reverse=True)
-    sorted_concepts, sorted_contributions = zip(*sorted_paired_lists)
-    sorted_concepts = list(sorted_concepts)
-    sorted_contributions = list(sorted_contributions)
-    st.session_state.contributions = sorted_contributions
-    st.session_state.toggles = {concept: False for concept in sorted_concepts}
+# === Create Letterhead PDF ===
+def create_letterhead_pdf(report_text, image: Image.Image, filename: str, meta: dict) -> str:
+    pdf_path = os.path.join(REPORT_DIR, f"{filename}.pdf")
+    c = canvas.Canvas(pdf_path, pagesize=letter)
+    width, height = letter
+    styles = getSampleStyleSheet()
 
-    col1, col2, col3 = st.columns([0.2, 0.5, 0.3])
+    def draw_header():
+        c.setFillColorRGB(0.2, 0.4, 0.6)
+        c.rect(0, height - 80, width, 80, fill=1)
+        c.setFillColorRGB(1, 1, 1)
+        text_x = 100
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(text_x, height - 50, "DIAGNOSTIC X-RAY CONSULTATION SERVICES®")
+        c.setFont("Helvetica", 11)
+        c.drawString(text_x, height - 68, "2525 W. Carefree Highway, Suite 114, Phoenix, AZ")
+        c.drawString(400, height - 68, "Phone: (602) 274-3331")
+        if os.path.exists(LOGO_PATH):
+            c.drawImage(LOGO_PATH, 40, height - 75, width=40, height=40)
 
-    with col1:
-        if predicted_class != 2:
-            st.subheader(":blue[Prediction:] :red[{}]".format(class_mapping[predicted_class]))
-        else:
-            st.subheader(":blue[Prediction:] :green[{}]".format(class_mapping[predicted_class]))
-        img = Image.open(uploaded_file)
-        img = np.array(img)
-        if st.session_state.selected_image is None:
-            st.session_state.selected_image = img
-        st.image(st.session_state.selected_image, width=300)
+    def draw_footer():
+        c.setFillColorRGB(0.85, 0.85, 0.85)
+        c.rect(0, 0, width, 50, fill=1)
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica", 9)
+        c.drawRightString(width - 40, 30, "Email: glongmuir@diagnosticx-ray.com")
 
-        if not np.array_equal(st.session_state.selected_image, img):
-            opacity = st.slider('Overlay Opacity', 0.0, 1.0, 0.3)
+    def draw_signature():
+        y_offset = 90
+        if os.path.exists(SIGN_PATH):
+            c.drawImage(SIGN_PATH, width - 180, y_offset, width=120, height=50, mask='auto')
+        c.setFont("Helvetica-Bold", 10)
+        c.drawRightString(width - 50, y_offset - 10, "Dr. GARY A. LONGMUIR")
+        c.setFont("Helvetica-Oblique", 9)
+        c.drawRightString(width - 50, y_offset - 22, "D.C., Ph.D., D.A.C.B.R.")
 
-        top_k = st.slider('Top K Concepts', 1, len(conc), 5)
+    # === Page 1 ===
+    draw_header()
+    draw_footer()
+    draw_signature()
 
-        if 'editable' not in st.session_state:
-            st.session_state.editable = False
+    frame = Frame(50, 100, width - 100, height - 200, showBoundary=0)
+    content = []
+    meta_style = ParagraphStyle("Meta", fontSize=13, spaceAfter=10)
+    italic_style = ParagraphStyle("Italic", fontSize=13, spaceAfter=10, fontName="Helvetica-Oblique")
+    heading_style = ParagraphStyle("Heading", fontSize=14, spaceAfter=12, fontName="Helvetica-Bold")
 
-        subcol1, subcol2 = st.columns([0.65, 0.35])
+    def add_field(label, value, style=meta_style):
+        content.append(Paragraph(f"<b>{label}:</b> {value}", style))
 
-        with subcol1:
-            if st.button('Edit Contribution'):
-                st.session_state.editable = not st.session_state.editable
-        
-        with subcol2:
-            if st.button("Reset Image"):
-                st.session_state.selected_image = img
+    add_field("Patient’s Name", meta["name"])
+    add_field("Referred by", meta["ref_by"])
+    add_field("Date Taken", meta["date_taken"])
+    add_field("Date of Report", meta["date_report"])
+    add_field("Patient’s Complaint", meta["complaint"], italic_style)
+    add_field("Patient’s History", meta["history"], italic_style)
+    content.append(Paragraph("Findings:", heading_style))
+    content.append(Paragraph(report_text.replace("\n", "<br/>"), meta_style))
+    frame.addFromList(content, c)
 
-        st.markdown(":blue[<b>Concepts Scores</b>]", unsafe_allow_html=True)
+    # === Page 2 ===
+    c.showPage()
+    draw_header()
+    draw_footer()
+    draw_signature()
 
-        with st.container(height=500):
-            updated_values = []
-            for i in range(top_k):
-                concept_name = sorted_concepts[i]
-                is_active = st.session_state.toggles[concept_name]
-                if st.session_state.contributions[i] <=0:
-                    disable_toggle = True
-                else:
-                    disable_toggle = False
-                toggle = st.toggle(concept_name, disabled = disable_toggle)
-                if toggle:
-                    for other_concept in sorted_concepts:
-                        if other_concept != concept_name:
-                            st.session_state.toggles[other_concept] = False
-                    st.session_state.toggles[concept_name] = True
-                    heat_map = get_heatmap(uploaded_file, concept_name)
-                    upsampled_similarity_map = zoom(heat_map, (256 / 14, 256 / 14), order=1)
-                    normalized_similarity_map = (upsampled_similarity_map - upsampled_similarity_map.min()) / \
-                                                (upsampled_similarity_map.max() - upsampled_similarity_map.min())
-                    threshold = 0.75
-                    normalized_similarity_map = np.where(normalized_similarity_map > threshold, normalized_similarity_map, np.nan)
-                    alpha_value = opacity if 'opacity' in locals() or 'opacity' in globals() else 0.3
-                    plt.figure(figsize=(8, 8))
-                    plt.imshow(img, cmap='gray') 
-                    plt.imshow(normalized_similarity_map, cmap='jet', alpha=alpha_value)
-                    plt.colorbar(label="Similarity")
-                    plt.axis('off')
-                    buf = BytesIO()
-                    plt.savefig(buf, format='png', bbox_inches='tight')
-                    buf.seek(0)
-                    st.session_state.selected_image = Image.open(buf)
-                value = st.slider(concept_name, -0.5, 0.5, st.session_state.contributions[i], disabled=not st.session_state.editable, label_visibility='collapsed')
-                updated_values.append(value)
+    # Draw X-ray image
+    image_path = os.path.join(REPORT_DIR, f"{filename}_img.jpg")
+    image.save(image_path)
+    img_w, img_h = 5.8 * inch, 5.8 * inch
+    img_x = (width - img_w) / 2
+    img_y = 230
 
-        if st.button('Confirm Contribution Score'):
-            st.session_state.editable = False
-            st.session_state.contributions[:top_k] = updated_values.copy()
-            with open(f'updated_contributions/{uploaded_file.name.split(".")[0]}.txt', 'w') as f:
-                for concept, value in zip(sorted_concepts, st.session_state.contributions):
-                    f.write(f"{concept}: {value}\n")
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, img_y + img_h + 15, "X-ray Image:")
+    c.drawImage(image_path, img_x, img_y, width=img_w, height=img_h)
 
-    with col2:
-        st.write()
-        if using_sample:
-            st.session_state.llama_index_agent = generate_report(class_mapping, predicted_class, sorted_concepts, sorted_contributions, None, return_tool=using_sample)
-        more_docs = st.radio("Do you want to add more clinical information about {} for report generation?".format(class_mapping[predicted_class]),
-                            ('Yes', 'No'), index=st.session_state.radio)
-        
-        if more_docs == 'No':
-            if not st.session_state.report_generated:
-                with st.spinner("Generating report..."):
-                    _, st.session_state.llama_index_agent, report, logs = generate_report(pneumonia_index, covid_index, class_mapping, predicted_class, sorted_concepts, sorted_contributions, None)
-                    st.session_state.report = report
-                    st.session_state.report_generated = True
-                    st.session_state.logs = logs
-                    st.session_state.logs_generated = True
-            st.session_state.logs = re.sub(r'\x1b\[[0-9;]*m', '', st.session_state.logs)
-            with st.expander("See logs for intermediate steps"):
-                html = "<div style='height: 300px; overflow-y: scroll; padding: 10px'>"
-                for log in st.session_state.logs.split("\n"):
-                    if "[DEBUG]" in log:
-                        html += f'<p style="color:blue">{log}</p>'
-                    elif ">" in log:
-                        html += f'<p style="color:red">{log}</p>'
-                    else:
-                        html += f'<p style="color:green">{log}</p>'
-                html += "</div>"
-                st.markdown(html, unsafe_allow_html=True)
-            st.markdown(":blue[<b>Generated Report</b>]", unsafe_allow_html=True)
-            with st.container(height=800):
-                st.markdown(st.session_state.report)
-            st.markdown(":blue[<i>The report is generated based on the predicted concept contribution scores and using available clinical documentations.</i>]", unsafe_allow_html=True)
+    c.save()
+    return pdf_path
 
-        if more_docs == 'Yes':
-            uploaded_files = st.file_uploader("Choose a file", accept_multiple_files=True)
-            if len(uploaded_files) != 0:
-                additional_logs = ""
-                transcription_bool = False
-                if st.session_state.nodes == False:
+# === Streamlit UI ===
+st.title("🩻 Chest X-ray Report Generator")
+st.write("Upload a chest X-ray image and fill in patient details to generate a medically formatted PDF report.")
 
-                    for uploaded_file in uploaded_files:
-                        if class_mapping[predicted_class] == 'Covid':
-                            temp_dir = "tmp_covid"
-                        if class_mapping[predicted_class] == 'Pneumonia':
-                            temp_dir = "tmp_pneumonia"
-                        if class_mapping[predicted_class] == 'Normal':
-                            temp_dir = "tmp_normal"
-                        if uploaded_file.name.endswith(('.mp3', '.mp4')):
-                            transcription_bool = True
-                            temp_file_path = os.path.join(temp_dir, uploaded_file.name)
-                            with open(temp_file_path, 'wb') as f:
-                                f.write(uploaded_file.getbuffer())
-                            
-                            transcription = transcribe(temp_file_path)
-                            
-                            txt_filename = uploaded_file.name.rsplit('.', 1)[0] + '.txt'
-                            txt_file_path = os.path.join(temp_dir, txt_filename)
-                            with open(txt_file_path, 'w') as txt_file:
-                                txt_file.write(transcription)
-                        else:
-                            file_path = os.path.join(temp_dir, uploaded_file.name)
-                            with open(file_path, 'wb') as f:
-                                f.write(uploaded_file.getbuffer())
+with st.form("report_form"):
+    st.subheader("🧾 Patient Details")
+    name = st.text_input("Patient’s Name")
+    ref_by = st.text_input("Referred by")
+    date_taken = st.date_input("Date Taken")
+    date_report = st.date_input("Date of Report")
+    complaint = st.text_area("Patient’s Complaint")
+    history = st.text_area("Patient’s History")
+    uploaded_file = st.file_uploader("Upload Chest X-ray", type=["png", "jpg", "jpeg"])
+    submitted = st.form_submit_button("🧠 Generate Report")
 
-                
-                    new_docs = SimpleDirectoryReader(input_dir=temp_dir, recursive=True).load_data()
-                    parser = SimpleNodeParser()
-                    new_nodes = parser.get_nodes_from_documents(new_docs)
-                    st.session_state.nodes = True
+if submitted and uploaded_file:
+    image = Image.open(uploaded_file).convert("RGB")
+    st.image(image, caption="Uploaded X-ray", use_column_width=True)
 
-                    if transcription_bool:
-                        additional_logs += "Transcribed the media file using Whisper.\n"
-                    additional_logs += "Parsed the additional documents and indexed them in the vector store.\n"
+    with st.spinner("Analyzing image and generating report..."):
+        report = generate_report(image)
+        st.subheader("Generated Findings")
+        st.text(report)
 
-                # if st.button("Generate Report"):
-                if not st.session_state.report_generated:
-                    with st.spinner("Generating report..."):
-                        _, st.session_state.llama_index_agent, report, logs = generate_report(pneumonia_index, covid_index, class_mapping, predicted_class, sorted_concepts, sorted_contributions, new_nodes)
-                        st.session_state.report = report
-                        st.session_state.report_generated = True
-                        st.session_state.logs = logs
-                        st.session_state.logs_generated = True
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        meta_data = {
+            "name": name,
+            "ref_by": ref_by,
+            "date_taken": str(date_taken),
+            "date_report": str(date_report),
+            "complaint": complaint,
+            "history": history,
+        }
 
-                st.session_state.logs = re.sub(r'\x1b\[[0-9;]*m', '', st.session_state.logs)
-                st.session_state.logs = additional_logs + st.session_state.logs
+        pdf_file = create_letterhead_pdf(report, image, f"report_{timestamp}", meta=meta_data)
 
-                with st.expander("See logs for intermediate steps"):
-                    html = "<div style='height: 300px; overflow-y: scroll; padding: 10px'>"
-                    for log in st.session_state.logs.split("\n"):
-                        if "[DEBUG]" in log:
-                            html += f'<p style="color:blue">{log}</p>'
-                        elif ">" in log:
-                            html += f'<p style="color:red">{log}</p>'
-                        else:
-                            html += f'<p style="color:green">{log}</p>'
-                    html += "</div>"
-                    st.markdown(html, unsafe_allow_html=True)
-                st.markdown(":blue[<b>Generated Report</b>]", unsafe_allow_html=True)
-                with st.container(height=800):
-                    st.markdown(st.session_state.report)
-                st.markdown(":blue[<i>The report is generated based on the predicted concept contribution scores and using available clinical documentations.</i>]", unsafe_allow_html=True)
+    
+        log_report(meta_data, pdf_file)
 
-    with col3:
-        if st.session_state.report_generated:
-            with st.container(height=1100):
-                if st.session_state.messages is None:
-                    st.session_state.messages = [
-                        {"role": "system", "content": f"You are a radiologist. The detected disease is {class_mapping[predicted_class]}. The concepts and their contributions to the classification are as follows: {sorted_concepts} and {sorted_contributions}. The higher values of contributions indicate the importance of the concepts in the classification of the disease. Negative values of contribution means the concept does not contribute for the classification. The disease has been detected based on the presence of these concepts. The radiology report for this patient has been generated as follows: {st.session_state.report}"},
-                        {"role": "assistant", "content": "Ask me anything about the chest x-ray report or the disease detected."}]
-
-                if prompt := st.chat_input("Your question"):
-                    st.session_state.messages.append({"role": "user", "content": prompt})
-                for message in st.session_state.messages:
-                    if message["role"] == "system":
-                        continue
-                    with st.chat_message(message["role"]):
-                        st.write(message["content"])
-
-                if st.session_state.messages[-1]["role"] != "assistant":
-                    with st.chat_message("assistant"):
-                        with st.spinner("Thinking..."):
-                            response = st.session_state.llama_index_agent.run(f"Question: prompt \n Previous messages: {st.session_state.messages}")
-                            st.write(response)
-                            message = {"role": "assistant", "content": response}
-                            st.session_state.messages.append(message)
+        with open(pdf_file, "rb") as f:
+            st.download_button("Download Report as PDF", f, file_name=os.path.basename(pdf_file))
