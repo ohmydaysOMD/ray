@@ -6,6 +6,7 @@ import torchvision.models as models
 from PIL import Image
 import os
 import requests
+import re
 
 # NIH ChestX-ray14 Disease Labels
 LABELS = [
@@ -14,7 +15,7 @@ LABELS = [
     'Emphysema', 'Fibrosis', 'Pleural_Thickening', 'Hernia'
 ]
 
-MODEL_FILENAME = "chexnet.pth"
+MODEL_FILENAME = "chexnet.pth.tar"
 
 # Access secrets
 GDRIVE_FILE_ID = st.secrets["gdrive_file_id"]
@@ -22,9 +23,10 @@ PAGE_PASSWORD = st.secrets["page_password"]
 
 def download_model():
     if not os.path.exists(MODEL_FILENAME):
-        with st.spinner("Downloading model... (may take up to 1–2 mins)"):
+        with st.spinner("Downloading model... (this may take 1-2 minutes)"):
             download_url = f"https://drive.google.com/uc?export=download&id={GDRIVE_FILE_ID}"
             response = requests.get(download_url, stream=True)
+            response.raise_for_status()
             with open(MODEL_FILENAME, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
@@ -40,14 +42,32 @@ def load_model():
     model.classifier = nn.Linear(num_ftrs, len(LABELS))
 
     checkpoint = torch.load(MODEL_FILENAME, map_location=torch.device("cpu"))
-    state_dict = checkpoint.get("state_dict", checkpoint)
 
+    # Try common keys for checkpoint formats
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    state_dict = checkpoint.get("model_state_dict", state_dict)
+
+    # Remove 'module.' prefix if present (common with DataParallel)
     new_state_dict = {}
     for k, v in state_dict.items():
         new_k = k.replace("module.", "") if k.startswith("module.") else k
         new_state_dict[new_k] = v
 
-    model.load_state_dict(new_state_dict)
+    try:
+        model.load_state_dict(new_state_dict)
+    except RuntimeError as e:
+        mismatch = str(e)
+        st.error("⚠️ Error loading model weights:\n" + mismatch)
+        
+        missing_keys = re.findall(r"Missing key\(s\) in state_dict: \[([^\]]+)\]", mismatch)
+        unexpected_keys = re.findall(r"Unexpected key\(s\) in state_dict: \[([^\]]+)\]", mismatch)
+        
+        if missing_keys:
+            st.error(f"Missing keys: {missing_keys}")
+        if unexpected_keys:
+            st.error(f"Unexpected keys: {unexpected_keys}")
+        st.stop()
+
     model.eval()
     return model
 
@@ -74,7 +94,7 @@ def password_check():
         st.error("❌ Incorrect password. Please try again.")
         st.stop()
 
-# Run password check
+# Run password check before showing app content
 password_check()
 
 # UI
@@ -85,7 +105,7 @@ uploaded_file = st.file_uploader("📁 Upload Chest X-ray", type=["jpg", "jpeg",
 
 if uploaded_file:
     image = Image.open(uploaded_file)
-    st.image(image, caption="Uploaded X-ray", use_column_width=True)
+    st.image(image, caption="Uploaded X-ray", use_container_width=True)
 
     model = load_model()
     tensor = preprocess_image(image)
