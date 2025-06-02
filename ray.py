@@ -4,9 +4,9 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 import torchvision.models as models
 from PIL import Image
-import os
 import requests
-import re
+import tempfile
+import os
 
 # NIH ChestX-ray14 Disease Labels
 LABELS = [
@@ -15,57 +15,81 @@ LABELS = [
     'Emphysema', 'Fibrosis', 'Pleural_Thickening', 'Hernia'
 ]
 
-MODEL_FILENAME = "chexnet.pth.tar"
+# Password protection
+def check_password():
+    password = st.secrets["auth"]["password"]
+    entered = st.text_input("Enter app password", type="password")
+    if entered != password:
+        st.error("❌ Incorrect password")
+        st.stop()
 
-# Access secrets
-GDRIVE_FILE_ID = st.secrets["gdrive_file_id"]
-PAGE_PASSWORD = st.secrets["page_password"]
+# Function to download model from Google Drive
+def download_from_gdrive(file_id, destination):
+    URL = "https://docs.google.com/uc?export=download"
 
-def download_model():
-    if not os.path.exists(MODEL_FILENAME):
-        with st.spinner("Downloading model... (this may take 1-2 minutes)"):
-            download_url = f"https://drive.google.com/uc?export=download&id={GDRIVE_FILE_ID}"
-            response = requests.get(download_url, stream=True)
-            response.raise_for_status()
-            with open(MODEL_FILENAME, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            st.success("Model downloaded successfully.")
+    session = requests.Session()
 
-@st.cache_resource
+    response = session.get(URL, params={'id': file_id}, stream=True)
+    token = get_confirm_token(response)
+
+    if token:
+        params = {'id': file_id, 'confirm': token}
+        response = session.get(URL, params=params, stream=True)
+
+    save_response_content(response, destination)
+
+def get_confirm_token(response):
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            return value
+    return None
+
+def save_response_content(response, destination):
+    CHUNK_SIZE = 32768
+
+    with open(destination, "wb") as f:
+        for chunk in response.iter_content(CHUNK_SIZE):
+            if chunk:
+                f.write(chunk)
+
+@st.cache_resource(show_spinner=True)
 def load_model():
-    download_model()
-
     model = models.densenet121(pretrained=False)
     num_ftrs = model.classifier.in_features
     model.classifier = nn.Linear(num_ftrs, len(LABELS))
 
-    checkpoint = torch.load(MODEL_FILENAME, map_location=torch.device("cpu"))
+    # Download model to temp file
+    file_id = st.secrets["google"]["file_id"]
+    tmp_dir = tempfile.gettempdir()
+    model_path = os.path.join(tmp_dir, "chexnet.pth.tar")
 
-    # Try common keys for checkpoint formats
-    state_dict = checkpoint.get("state_dict", checkpoint)
-    state_dict = checkpoint.get("model_state_dict", state_dict)
+    if not os.path.exists(model_path):
+        download_from_gdrive(file_id, model_path)
 
-    # Remove 'module.' prefix if present (common with DataParallel)
+    checkpoint = torch.load(model_path, map_location=torch.device("cpu"))
+
+    # Try to get state_dict with common keys
+    if "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    elif "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+
+    # Clean key prefixes if necessary
     new_state_dict = {}
     for k, v in state_dict.items():
-        new_k = k.replace("module.", "") if k.startswith("module.") else k
+        new_k = k
+        if k.startswith("module."):
+            new_k = k[len("module."):]
+        if k.startswith("model."):
+            new_k = new_k[len("model."):]
         new_state_dict[new_k] = v
 
     try:
         model.load_state_dict(new_state_dict)
     except RuntimeError as e:
-        mismatch = str(e)
-        st.error("⚠️ Error loading model weights:\n" + mismatch)
-        
-        missing_keys = re.findall(r"Missing key\(s\) in state_dict: \[([^\]]+)\]", mismatch)
-        unexpected_keys = re.findall(r"Unexpected key\(s\) in state_dict: \[([^\]]+)\]", mismatch)
-        
-        if missing_keys:
-            st.error(f"Missing keys: {missing_keys}")
-        if unexpected_keys:
-            st.error(f"Unexpected keys: {unexpected_keys}")
+        st.error(f"⚠️ Error loading model weights: {e}")
         st.stop()
 
     model.eval()
@@ -87,18 +111,11 @@ def predict(model, img_tensor):
         probs = torch.sigmoid(outputs).squeeze()
         return {LABELS[i]: float(probs[i]) for i in range(len(LABELS))}
 
-# PASSWORD PROTECT THE APP
-def password_check():
-    pwd = st.text_input("Enter password to access the app", type="password")
-    if pwd != PAGE_PASSWORD:
-        st.error("❌ Incorrect password. Please try again.")
-        st.stop()
+# --- APP UI ---
 
-# Run password check before showing app content
-password_check()
-
-# UI
 st.title("🩻 CheXNet Chest X-ray Diagnosis")
+check_password()
+
 st.markdown("Upload a chest X-ray image (JPG or PNG). The model predicts likelihoods for 14 thoracic diseases.")
 
 uploaded_file = st.file_uploader("📁 Upload Chest X-ray", type=["jpg", "jpeg", "png"])
