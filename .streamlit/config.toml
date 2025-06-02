@@ -1,8 +1,1 @@
-[server]
-fileWatcherType = "none"
 
-[logger]
-level = "error"
-
-[global]
-developmentMode = false
