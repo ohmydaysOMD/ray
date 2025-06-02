@@ -2,27 +2,26 @@ import os
 import sys
 import logging
 import warnings
-import tempfile
 from PIL import Image
 import requests
+import tempfile
 
 # Configure warnings and logging before imports
 warnings.filterwarnings('ignore')
 logging.getLogger("torch._classes").setLevel(logging.ERROR)
 os.environ['PYTHONWARNINGS'] = 'ignore'
 
-# Import streamlit and configure it
-import streamlit as st
-st.set_option('server.fileWatcherType', 'none')  # Disable file watcher
-
-# Now import torch and related modules
+# Torch imports
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 import torchvision.models as models
 
+# Import streamlit last
+import streamlit as st
+
 # Configure torch
-torch.set_grad_enabled(False)  # Disable gradients globally
+torch.set_grad_enabled(False)
 
 # NIH ChestX-ray14 Disease Labels
 LABELS = [
@@ -31,8 +30,73 @@ LABELS = [
     'Emphysema', 'Fibrosis', 'Pleural_Thickening', 'Hernia'
 ]
 
+class ModelWrapper:
+    def __init__(self):
+        self.model = None
+        self.device = 'cpu'
+    
+    def load(self):
+        if self.model is None:
+            self.model = self._initialize_model()
+        return self.model
+    
+    def _initialize_model(self):
+        try:
+            model = models.densenet121(weights=None)
+            model.classifier = nn.Linear(model.classifier.in_features, len(LABELS))
+            
+            # Download and load weights
+            file_id = st.secrets["google"]["file_id"]
+            model_path = os.path.join(tempfile.gettempdir(), "chexnet.pth.tar")
+            
+            if not os.path.exists(model_path):
+                self._download_weights(file_id, model_path)
+            
+            checkpoint = torch.load(model_path, map_location=self.device)
+            state_dict = self._get_state_dict(checkpoint)
+            model.load_state_dict(state_dict)
+            model.eval()
+            
+            return model
+        except Exception as e:
+            st.error(f"Failed to initialize model: {str(e)}")
+            st.stop()
+    
+    def _download_weights(self, file_id, destination):
+        try:
+            URL = "https://docs.google.com/uc?export=download"
+            with st.spinner("Downloading model weights..."):
+                session = requests.Session()
+                response = session.get(URL, params={'id': file_id}, stream=True)
+                
+                token = next((value for key, value in response.cookies.items() 
+                            if key.startswith('download_warning')), None)
+                
+                if token:
+                    response = session.get(URL, 
+                                        params={'id': file_id, 'confirm': token}, 
+                                        stream=True)
+                
+                with open(destination, "wb") as f:
+                    for chunk in response.iter_content(32768):
+                        if chunk:
+                            f.write(chunk)
+        except Exception as e:
+            st.error(f"Failed to download model weights: {str(e)}")
+            st.stop()
+    
+    def _get_state_dict(self, checkpoint):
+        if isinstance(checkpoint, dict):
+            state_dict = (checkpoint.get("state_dict") or 
+                         checkpoint.get("model_state_dict") or 
+                         checkpoint)
+        else:
+            state_dict = checkpoint
+            
+        return {k.replace("module.", "").replace("model.", ""): v 
+                for k, v in state_dict.items()}
+
 def check_password():
-    """Password protection."""
     try:
         password = st.secrets["auth"]["password"]
         entered = st.text_input("Enter app password", type="password")
@@ -43,71 +107,7 @@ def check_password():
         st.error(f"Authentication error: {str(e)}")
         st.stop()
 
-def download_from_gdrive(file_id, destination):
-    """Download model from Google Drive with proper error handling."""
-    try:
-        URL = "https://docs.google.com/uc?export=download"
-        with st.spinner("Downloading model..."):
-            session = requests.Session()
-            response = session.get(URL, params={'id': file_id}, stream=True)
-            
-            token = next((value for key, value in response.cookies.items() 
-                         if key.startswith('download_warning')), None)
-            
-            if token:
-                response = session.get(URL, params={'id': file_id, 'confirm': token}, 
-                                    stream=True)
-            
-            with open(destination, "wb") as f:
-                for chunk in response.iter_content(32768):
-                    if chunk:
-                        f.write(chunk)
-    except Exception as e:
-        st.error(f"Failed to download model: {str(e)}")
-        st.stop()
-
-@st.cache_resource(show_spinner=True)
-def load_model():
-    """Load and configure the model with proper error handling."""
-    try:
-        # Initialize model
-        model = models.densenet121(weights=None)
-        model.classifier = nn.Linear(model.classifier.in_features, len(LABELS))
-        
-        # Prepare model path
-        file_id = st.secrets["google"]["file_id"]
-        model_path = os.path.join(tempfile.gettempdir(), "chexnet.pth.tar")
-        
-        # Download if needed
-        if not os.path.exists(model_path):
-            download_from_gdrive(file_id, model_path)
-        
-        # Load checkpoint
-        checkpoint = torch.load(model_path, map_location='cpu')
-        
-        # Extract state dict
-        state_dict = (checkpoint.get("state_dict") or 
-                     checkpoint.get("model_state_dict") or 
-                     checkpoint)
-        
-        # Clean state dict
-        cleaned_state_dict = {
-            k.replace("module.", "").replace("model.", ""): v 
-            for k, v in state_dict.items()
-        }
-        
-        # Load weights
-        model.load_state_dict(cleaned_state_dict)
-        model.eval()
-        
-        return model
-    
-    except Exception as e:
-        st.error(f"Model loading failed: {str(e)}")
-        st.stop()
-
 def preprocess_image(image):
-    """Preprocess image for model input."""
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
@@ -120,7 +120,6 @@ def preprocess_image(image):
     return transform(image.convert("RGB")).unsqueeze(0)
 
 def predict(model, img_tensor):
-    """Make predictions with proper error handling."""
     try:
         outputs = model(img_tensor)
         probs = torch.sigmoid(outputs).squeeze()
@@ -129,8 +128,10 @@ def predict(model, img_tensor):
         st.error(f"Prediction failed: {str(e)}")
         st.stop()
 
+# Initialize model wrapper
+model_wrapper = ModelWrapper()
+
 def main():
-    """Main application function."""
     try:
         st.title("🩻 CheXNet Chest X-ray Diagnosis")
         check_password()
@@ -148,8 +149,8 @@ def main():
             st.image(image, caption="Uploaded X-ray", use_container_width=True)
             
             # Process image
-            with st.spinner("Processing image..."):
-                model = load_model()
+            with st.spinner("Analyzing image..."):
+                model = model_wrapper.load()
                 tensor = preprocess_image(image)
                 predictions = predict(model, tensor)
             
