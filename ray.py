@@ -14,7 +14,7 @@ LABELS = [
     'Emphysema', 'Fibrosis', 'Pleural_Thickening', 'Hernia'
 ]
 
-MODEL_FILENAME = "chexnet.pth.tar"
+MODEL_FILENAME = "chexnet.pth"
 
 # Access secrets
 GDRIVE_FILE_ID = st.secrets["gdrive_file_id"]
