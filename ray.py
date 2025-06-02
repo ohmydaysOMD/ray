@@ -1,3 +1,11 @@
+import asyncio
+
+# Workaround for "no running event loop" RuntimeError in Streamlit with Python 3.10+
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -26,16 +34,12 @@ def check_password():
 # Function to download model from Google Drive
 def download_from_gdrive(file_id, destination):
     URL = "https://docs.google.com/uc?export=download"
-
     session = requests.Session()
-
     response = session.get(URL, params={'id': file_id}, stream=True)
     token = get_confirm_token(response)
-
     if token:
         params = {'id': file_id, 'confirm': token}
         response = session.get(URL, params=params, stream=True)
-
     save_response_content(response, destination)
 
 def get_confirm_token(response):
@@ -46,7 +50,6 @@ def get_confirm_token(response):
 
 def save_response_content(response, destination):
     CHUNK_SIZE = 32768
-
     with open(destination, "wb") as f:
         for chunk in response.iter_content(CHUNK_SIZE):
             if chunk:
@@ -82,7 +85,7 @@ def load_model():
         new_k = k
         if k.startswith("module."):
             new_k = k[len("module."):]
-        if k.startswith("model."):
+        if new_k.startswith("model."):
             new_k = new_k[len("model."):]
         new_state_dict[new_k] = v
 
@@ -100,7 +103,8 @@ def preprocess_image(image):
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
     ])
     image = image.convert("RGB")
     return transform(image).unsqueeze(0)
