@@ -1,4 +1,5 @@
+streamlit
 torch
 torchvision
-streamlit
 Pillow
+nest-asyncio
